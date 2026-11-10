@@ -69,6 +69,9 @@ jobs:
           up["endpoints"] = [
               f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/releases/download/linux-latest/latest.json"
           ]
+          # upstream does not request updater artifacts from its bundle config;
+          # ask for them here so this fork publishes a signed .sig
+          d.setdefault("bundle", {})["createUpdaterArtifacts"] = True
           p.write_text(json.dumps(d, indent=2) + "\n")
           print("updater ->", up["endpoints"][0])
           PY
