@@ -1,0 +1,159 @@
+name: omher linux build
+
+# Builds the OMHER desktop app for Linux whenever upstream publishes a release,
+# and publishes the AppImage as a release in this fork. Upstream ships macOS and
+# Windows only; this workflow is the Linux packaging layer, no source changes.
+on:
+  schedule:
+    - cron: "15 */6 * * *"
+  push:
+    paths:
+      - ".github/workflows/omher-linux.yml"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream tag to build (default: latest release)"
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: omher-linux
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: rlaope/oh-my-hermes
+  # tauri updater public key for this fork (private key lives in repo secrets)
+  UPDATE_PUBKEY: "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDg3ODFBRTIzQzQwMEIyREYKUldUZnNnREVJNjZCaDBDdFhDN3dJM2RadTEzRDBTUlVtWll4Y1NGbDdOOGJ4akVYQjMyZWRacXoK"
+
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Resolve upstream tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.tag }}"
+          if [ -z "${TAG}" ]; then
+            TAG=$(curl -sSf "https://api.github.com/repos/${UPSTREAM}/releases/latest" | jq -r .tag_name)
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          if gh release view "linux-${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "release linux-${TAG} already exists - nothing to do"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout upstream tag
+        if: steps.tag.outputs.skip == 'false'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: ${{ steps.tag.outputs.tag }}
+          fetch-depth: 1
+
+      - name: Point the updater at this fork
+        if: steps.tag.outputs.skip == 'false'
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib
+          p = pathlib.Path("apps/omher/src-tauri/tauri.conf.json")
+          d = json.loads(p.read_text())
+          up = d.setdefault("plugins", {}).setdefault("updater", {})
+          up["pubkey"] = os.environ["UPDATE_PUBKEY"]
+          up["endpoints"] = [
+              f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/releases/download/linux-latest/latest.json"
+          ]
+          p.write_text(json.dumps(d, indent=2) + "\n")
+          print("updater ->", up["endpoints"][0])
+          PY
+
+      - uses: actions/setup-node@v4
+        if: steps.tag.outputs.skip == 'false'
+        with:
+          node-version: "24"
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.tag.outputs.skip == 'false'
+
+      - name: Linux build dependencies
+        if: steps.tag.outputs.skip == 'false'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
+            librsvg2-dev patchelf build-essential libssl-dev libxdo-dev
+
+      - name: Install JS dependencies
+        if: steps.tag.outputs.skip == 'false'
+        working-directory: apps/omher
+        run: |
+          corepack enable
+          pnpm install --frozen-lockfile
+
+      - name: Build AppImage
+        if: steps.tag.outputs.skip == 'false'
+        working-directory: apps/omher
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: pnpm tauri build --bundles appimage
+
+      - name: Collect artifacts
+        id: art
+        if: steps.tag.outputs.skip == 'false'
+        working-directory: apps/omher
+        run: |
+          set -euo pipefail
+          V=$(python3 -c "import json;print(json.load(open('src-tauri/tauri.conf.json'))['version'])")
+          B=src-tauri/target/release/bundle/appimage
+          OUT=omher-${V}-linux-x64.AppImage
+          mv "$B"/*.AppImage "$OUT"
+          cp "$B"/*.AppImage.sig "${OUT}.sig"
+          echo "version=${V}" >> "$GITHUB_OUTPUT"
+          echo "asset=${OUT}" >> "$GITHUB_OUTPUT"
+          ls -la "$OUT" "${OUT}.sig"
+
+      - name: Publish versioned release
+        if: steps.tag.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        working-directory: apps/omher
+        run: |
+          set -euo pipefail
+          TAG="linux-${{ steps.tag.outputs.tag }}"
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "OMHER ${{ steps.art.outputs.version }} (Linux build of ${{ steps.tag.outputs.tag }})" \
+            --notes "Linux AppImage built from upstream ${{ steps.tag.outputs.tag }}. Upstream ships macOS and Windows only; this is the packaging layer, no source changes. sha256 in the asset list." \
+            "${{ steps.art.outputs.asset }}" "${{ steps.art.outputs.asset }}.sig"
+
+      - name: Update the updater manifest
+        if: steps.tag.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        working-directory: apps/omher
+        run: |
+          set -euo pipefail
+          V="${{ steps.art.outputs.version }}"
+          TAG="${{ steps.tag.outputs.tag }}"
+          ASSET="${{ steps.art.outputs.asset }}"
+          URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/linux-${TAG}/${ASSET}"
+          SIG=$(cat "${ASSET}.sig")
+          python3 - "$V" "$URL" "$SIG" <<'PY'
+          import json, sys, datetime
+          v, url, sig = sys.argv[1], sys.argv[2], sys.argv[3]
+          json.dump({
+              "version": v,
+              "pub_date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "platforms": {"linux-x86_64": {"signature": sig, "url": url}},
+          }, open("latest.json", "w"), indent=2)
+          PY
+          gh release view linux-latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create linux-latest --repo "$GITHUB_REPOSITORY" --prerelease \
+              --title "Linux updater manifest" --notes "Stable latest.json for the Linux AppImage updater."
+          gh release upload linux-latest latest.json --repo "$GITHUB_REPOSITORY" --clobber
